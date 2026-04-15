@@ -33,6 +33,13 @@ async function runCrawlCycle() {
 // AI Worker chạy liên tục, poll pending articles
 startWorker();
 
+// Health check server — Render Web Service cần có port
+const PORT = process.env.PORT || 4000;
+require('http').createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', service: 'ai-wp-scraper', time: new Date().toISOString() }));
+}).listen(PORT, () => console.log(`[Scraper] Health check listening on port ${PORT}`));
+
 // Crawl ngay lần đầu khi start
 runCrawlCycle();
 
