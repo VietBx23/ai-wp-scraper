@@ -63,7 +63,9 @@ const Article = {
      * Worker gọi hàm này sau khi AI xong
      * Update title_ai, content_ai, status: processed
      */
-    async updateAI(id, ai) {
+    async updateAI(id, ai, titleRaw) {
+        // Dùng titleRaw (English) để tạo slug, không dùng title_ai (có thể là Urdu/Hindi/Bengali)
+        const slug = slugify(titleRaw || ai.title);
         await db.query(
             `UPDATE articles SET
                 title_ai = ?, content_ai = ?, slug = ?,
@@ -71,7 +73,7 @@ const Article = {
                 status = 'processed'
              WHERE id = ?`,
             [
-                ai.title, ai.content, slugify(ai.title),
+                ai.title, ai.content, slug,
                 ai.meta_description || null, ai.focus_keyword || null,
                 id,
             ]

@@ -48,7 +48,7 @@ async function processOne(article) {
             await Article.updateStatus(article.id, 'ai_error');
             return;
         }
-        await Article.updateAI(article.id, ai);
+        await Article.updateAI(article.id, ai, article.title_raw);
         console.log(`   ✅ [${article.language}] ${ai.title.slice(0, 60)}`);
     } catch (e) {
         console.error(`   ❌ [${article.language}] Error: ${e.message}`);
