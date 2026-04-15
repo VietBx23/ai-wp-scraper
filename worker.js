@@ -4,8 +4,12 @@ const { rewriteAllLanguages } = require('./ai');
 
 const BATCH_SIZE    = parseInt(process.env.WORKER_BATCH_SIZE) || 4;
 const POLL_INTERVAL = parseInt(process.env.WORKER_POLL_MS)    || 20000;
+const MAX_RETRIES   = 3;
 
 let isWorking = false;
+
+// Track số lần thử per article id (in-memory, reset khi restart)
+const retryCount = new Map();
 
 async function claimBatch() {
     const conn = await db.getConnection();
@@ -36,23 +40,44 @@ async function claimBatch() {
 }
 
 async function processOne(article) {
-    console.log(`[Worker] [${article.language}] "${article.title_raw?.slice(0, 60)}"`);
+    const key = article.id;
+    const attempts = (retryCount.get(key) || 0) + 1;
+    retryCount.set(key, attempts);
+
+    console.log(`[Worker] [${article.language}] attempt ${attempts}/${MAX_RETRIES}: "${article.title_raw?.slice(0, 55)}"`);
+
     try {
         const results = await rewriteAllLanguages(
             article.content_raw, article.title_raw, article.featured_image,
             [article.language]
         );
         const ai = results[article.language];
+
         if (!ai) {
-            console.log(`   ❌ [${article.language}] AI failed`);
-            await Article.updateStatus(article.id, 'ai_error');
+            if (attempts < MAX_RETRIES) {
+                console.log(`   ⚠️  [${article.language}] AI failed — will retry (${attempts}/${MAX_RETRIES})`);
+                // Reset về pending để cycle sau pick lại
+                await Article.updateStatus(article.id, 'pending');
+            } else {
+                console.log(`   ❌ [${article.language}] AI failed after ${MAX_RETRIES} attempts — marking ai_error`);
+                await Article.updateStatus(article.id, 'ai_error');
+                retryCount.delete(key);
+            }
             return;
         }
+
         await Article.updateAI(article.id, ai, article.title_raw);
         console.log(`   ✅ [${article.language}] ${ai.title.slice(0, 60)}`);
+        retryCount.delete(key); // success, clear counter
     } catch (e) {
         console.error(`   ❌ [${article.language}] Error: ${e.message}`);
-        await Article.updateStatus(article.id, 'ai_error');
+        if (attempts < MAX_RETRIES) {
+            console.log(`   ⚠️  Will retry (${attempts}/${MAX_RETRIES})`);
+            await Article.updateStatus(article.id, 'pending');
+        } else {
+            await Article.updateStatus(article.id, 'ai_error');
+            retryCount.delete(key);
+        }
     }
 }
 
@@ -83,7 +108,7 @@ async function resetStuck() {
 }
 
 function startWorker() {
-    console.log(`[Worker] Started — poll every ${POLL_INTERVAL / 1000}s, batch=${BATCH_SIZE}`);
+    console.log(`[Worker] Started — poll every ${POLL_INTERVAL / 1000}s, batch=${BATCH_SIZE}, max retries=${MAX_RETRIES}`);
     resetStuck();
     runCycle();
     setInterval(runCycle, POLL_INTERVAL);
