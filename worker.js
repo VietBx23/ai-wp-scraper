@@ -1,7 +1,6 @@
 const db = require('./db');
 const Article = require('./article');
 const { rewriteAllLanguages } = require('./ai');
-const { notify } = require('./notify');
 
 const BATCH_SIZE    = parseInt(process.env.WORKER_BATCH_SIZE) || 4;
 const POLL_INTERVAL = parseInt(process.env.WORKER_POLL_MS)    || 20000;
@@ -51,7 +50,6 @@ async function processOne(article) {
         }
         await Article.updateAI(article.id, ai);
         console.log(`   ✅ [${article.language}] ${ai.title.slice(0, 60)}`);
-        await notify('article_processed', { id: article.id, title: ai.title, language: article.language });
     } catch (e) {
         console.error(`   ❌ [${article.language}] Error: ${e.message}`);
         await Article.updateStatus(article.id, 'ai_error');
