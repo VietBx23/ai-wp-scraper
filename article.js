@@ -1,7 +1,3 @@
-/**
- * Minimal Article model — writes directly to shared MySQL DB
- * Same table structure as backend models/Article.js
- */
 const db = require('./db');
 
 function slugify(text) {
@@ -34,40 +30,65 @@ const Article = {
                 parts.push(`${k} = ?`); params.push(v);
             }
         }
-        const sql = parts.join(' AND ') || '1=1';
-        const [[row]] = await db.query(`SELECT id, origin_id, language FROM articles WHERE ${sql} LIMIT 1`, params);
+        const [[row]] = await db.query(
+            `SELECT id, origin_id, language FROM articles WHERE ${parts.join(' AND ') || '1=1'} LIMIT 1`,
+            params
+        );
         return row || null;
     },
 
-    async create(data) {
-        const slug = slugify(data.title_ai || data.title_raw || `article-${Date.now()}`);
+    /**
+     * Crawlers gọi hàm này — insert raw content, status: pending
+     * Chưa có title_ai/content_ai, worker sẽ xử lý sau
+     */
+    async createPending(data) {
+        const slug = slugify(data.title_raw || `article-${Date.now()}`);
         const [result] = await db.query(
             `INSERT INTO articles
-             (origin_id, language, source_url, title_raw, content_raw, title_ai, content_ai,
-              slug, meta_description, focus_keyword, featured_image, author,
-              post_date, category, status, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+             (origin_id, language, source_url, title_raw, content_raw,
+              slug, featured_image, author, post_date, category, status, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,NOW())`,
             [
                 data.origin_id || null, data.language || 'English', data.source_url || null,
                 data.title_raw || null, data.content_raw || null,
-                data.title_ai || null, data.content_ai || null,
-                slug, data.meta_description || null, data.focus_keyword || null,
-                data.featured_image || null, data.author || 'Admin',
+                slug, data.featured_image || null, data.author || 'Admin',
                 toDatetime(data.post_date), data.category || 'Cricket News',
-                data.status || 'processed'
+                'pending',
             ]
         );
-        const id = result.insertId;
-        if (data.keywords?.length) {
-            for (const kw of data.keywords) {
+        return { id: result.insertId, ...data };
+    },
+
+    /**
+     * Worker gọi hàm này sau khi AI xong
+     * Update title_ai, content_ai, status: processed
+     */
+    async updateAI(id, ai) {
+        await db.query(
+            `UPDATE articles SET
+                title_ai = ?, content_ai = ?, slug = ?,
+                meta_description = ?, focus_keyword = ?,
+                status = 'processed'
+             WHERE id = ?`,
+            [
+                ai.title, ai.content, slugify(ai.title),
+                ai.meta_description || null, ai.focus_keyword || null,
+                id,
+            ]
+        );
+        if (ai.keywords?.length) {
+            for (const kw of ai.keywords) {
                 if (kw) await db.query(
                     `INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES (?,?)`,
                     [id, String(kw).slice(0, 255)]
                 );
             }
         }
-        return { id, ...data };
-    }
+    },
+
+    async updateStatus(id, status) {
+        await db.query(`UPDATE articles SET status = ? WHERE id = ?`, [status, id]);
+    },
 };
 
 module.exports = Article;

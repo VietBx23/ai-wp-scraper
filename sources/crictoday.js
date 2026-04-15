@@ -2,15 +2,14 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const dayjs = require('dayjs');
 const Article = require('../article');
-const { rewriteAllLanguages } = require('../ai');
-const { notify } = require('../notify');
 
+const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
+const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0' };
-const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 3;
 
 async function scrapeDetail(url) {
     try {
-        const { data } = await axios.get(url, { headers: HEADERS });
+        const { data } = await axios.get(url, { headers: HEADERS, timeout: 20000 });
         const $ = cheerio.load(data);
         $('.responsive-ad-css, .trusted-wrapper, script, ins, style').remove();
         const title = $('.gh-post-page__title').text().trim();
@@ -28,8 +27,7 @@ async function run() {
     try {
         const { data } = await axios.get('https://crictoday.com/cricket/news?page=1', { headers: HEADERS });
         const $ = cheerio.load(data);
-        const items = $('.gh-archive-page-post').toArray();
-        for (const el of items) {
+        for (const el of $('.gh-archive-page-post').toArray()) {
             if (count >= MAX) break;
             const $el = $(el);
             const rawDate = $el.find('.gh-post-info__date').text().trim();
@@ -42,18 +40,18 @@ async function run() {
             if (exists) continue;
             const detail = await scrapeDetail(link);
             if (!detail) continue;
-            const langs = ['English', 'Hindi', 'Bengali', 'Urdu'];
-            const results = await rewriteAllLanguages(detail.content, detail.title, detail.featured_image, langs);
-            for (const lang of langs) {
-                const ai = results[lang];
-                if (!ai) continue;
-                await Article.create({ origin_id: originId, source_url: link, language: lang, title_raw: detail.title, content_raw: detail.content, featured_image: detail.featured_image, author: 'CricToday', category: 'Cricket News', post_date: new Date(), title_ai: ai.title, content_ai: ai.content, meta_description: ai.meta_description, focus_keyword: ai.focus_keyword, keywords: ai.keywords, status: 'processed' });
-                console.log(`   ✅ [${lang}] ${ai.title}`);
-                await notify('article_processed', { title: ai.title, language: lang, source: 'CricToday', status: 'processed' });
+            for (const lang of LANGS) {
+                await Article.createPending({
+                    origin_id: originId, source_url: link, language: lang,
+                    title_raw: detail.title, content_raw: detail.content,
+                    featured_image: detail.featured_image, author: 'CricToday',
+                    category: 'Cricket News', post_date: new Date(),
+                });
             }
+            console.log(`[CricToday] Queued: ${detail.title.slice(0, 60)}`);
             count++;
         }
-        console.log(`[CricToday] Done. ${count} new articles.`);
+        console.log(`[CricToday] Done. ${count} articles queued.`);
     } catch (e) { console.error('[CricToday] Error:', e.message); }
 }
 

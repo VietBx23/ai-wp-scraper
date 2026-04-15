@@ -14,7 +14,7 @@ const pool = mysql.createPool({
 });
 
 pool.getConnection()
-    .then(conn => { console.log('✅ [Crawler] MySQL connected'); conn.release(); })
-    .catch(err => { console.error('❌ [Crawler] MySQL failed:', err.message); });
+    .then(conn => { console.log('✅ [Scraper] MySQL connected'); conn.release(); })
+    .catch(err => { console.error('❌ [Scraper] MySQL failed:', err.message); process.exit(1); });
 
 module.exports = pool;

@@ -1,10 +1,9 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const Article = require('../article');
-const { rewriteAllLanguages } = require('../ai');
-const { notify } = require('../notify');
 
-const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 3;
+const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
+const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36' };
 
 function isToday(dateStr) {
@@ -37,7 +36,9 @@ async function run() {
     console.log('[CricketAddictor] Scanning...');
     let count = 0;
     try {
-        const { data } = await axios.get('https://cricketaddictor.com/ipl-2026/news/', { headers: HEADERS, timeout: 30000 });
+        const { data } = await axios.get('https://cricketaddictor.com/ipl-2026/news/', {
+            headers: HEADERS, timeout: 30000
+        });
         const $ = cheerio.load(data);
         const items = [];
         const seen = new Set();
@@ -55,19 +56,19 @@ async function run() {
             if (exists) continue;
             const detail = await scrapeDetail(url);
             if (!detail) continue;
-            const langs = ['English', 'Hindi', 'Bengali', 'Urdu'];
-            const results = await rewriteAllLanguages(detail.content, detail.title, detail.featured_image, langs);
-            for (const lang of langs) {
-                const ai = results[lang];
-                if (!ai) continue;
-                await Article.create({ origin_id: url, source_url: url, language: lang, title_raw: detail.title, content_raw: detail.content, featured_image: detail.featured_image, author: detail.author, category: detail.category, post_date: new Date(), title_ai: ai.title, content_ai: ai.content, meta_description: ai.meta_description, focus_keyword: ai.focus_keyword, keywords: ai.keywords, status: 'processed' });
-                console.log(`   ✅ [${lang}] ${ai.title}`);
-                await notify('article_processed', { title: ai.title, language: lang, source: 'CricketAddictor', status: 'processed' });
+            for (const lang of LANGS) {
+                await Article.createPending({
+                    origin_id: url, source_url: url, language: lang,
+                    title_raw: detail.title, content_raw: detail.content,
+                    featured_image: detail.featured_image, author: detail.author,
+                    category: detail.category, post_date: new Date(),
+                });
             }
+            console.log(`[CricketAddictor] Queued: ${detail.title.slice(0, 60)}`);
             count++;
-            await new Promise(r => setTimeout(r, 1500));
+            await new Promise(r => setTimeout(r, 500));
         }
-        console.log(`[CricketAddictor] Done. ${count} new articles.`);
+        console.log(`[CricketAddictor] Done. ${count} articles queued.`);
     } catch (e) {
         if (e.response?.status === 403) console.log('[CricketAddictor] Blocked (403).');
         else console.error('[CricketAddictor] Error:', e.message);
