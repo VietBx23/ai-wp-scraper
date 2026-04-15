@@ -32,10 +32,10 @@ async function claimBatch() {
         await conn.commit();
         return rows;
     } catch (e) {
-        await conn.rollback();
+        try { await conn.rollback(); } catch (_) {}
         throw e;
     } finally {
-        conn.release();
+        try { conn.release(); } catch (_) {}
     }
 }
 
@@ -93,7 +93,11 @@ async function runCycle() {
             await new Promise(r => setTimeout(r, 2000));
         }
     } catch (e) {
-        console.error('[Worker] Cycle error:', e.message);
+        if (e.message?.includes('closed state') || e.message?.includes('connection')) {
+            console.warn('[Worker] DB connection lost, will retry next cycle.');
+        } else {
+            console.error('[Worker] Cycle error:', e.message);
+        }
     } finally {
         isWorking = false;
     }
