@@ -41,8 +41,17 @@ function cleanAndParseJSON(text) {
 function validateOutput(parsed, lang) {
     if (!parsed?.title || !parsed?.content) return false;
     if (parsed.title.trim().length < 10 || parsed.content.trim().length < 200) return false;
-    const checks = { Hindi: /[\u0900-\u097F]/, Bengali: /[\u0980-\u09FF]/, Urdu: /[\u0600-\u06FF]/ };
-    if (checks[lang] && !checks[lang].test(parsed.content)) return false;
+    // Chỉ cần có ít nhất 10 ký tự của ngôn ngữ đó — tránh false negative khi HTML tags lẫn Latin
+    const checks = {
+        Hindi:   { re: /[\u0900-\u097F]/, min: 10 },
+        Bengali: { re: /[\u0980-\u09FF]/, min: 10 },
+        Urdu:    { re: /[\u0600-\u06FF]/, min: 10 },
+    };
+    const check = checks[lang];
+    if (check) {
+        const matches = parsed.content.match(check.re) || [];
+        if (matches.length < check.min) return false;
+    }
     return true;
 }
 
@@ -95,18 +104,29 @@ CONTENT: ${content?.slice(0, 2500)}`;
 async function writeFromFacts(facts, title, lang) {
     const langMap = {
         English: 'Write in fluent English.',
-        Hindi:   'हिंदी में लिखें।',
-        Bengali: 'বাংলায় লিখুন।',
-        Urdu:    'اردو میں لکھیں۔',
+        Hindi:   'हिंदी में लिखें। पूरा लेख हिंदी में होना चाहिए।',
+        Bengali: 'বাংলায় লিখুন। পুরো নিবন্ধটি বাংলায় হওয়া উচিত।',
+        Urdu:    'اردو میں لکھیں۔ پورا مضمون اردو میں ہونا چاہیے۔',
     };
-    const prompt = `Write a complete SEO-optimized cricket article in ${lang}. ${langMap[lang] || ''}
-WRITE ENTIRELY IN ${lang}. Use these facts:
+    const prompt = `Write a complete SEO-optimized cricket article in ${lang}. ${langMap[lang]}
+IMPORTANT: The entire article MUST be written in ${lang} script only.
+Use these facts:
 ${JSON.stringify(facts, null, 2)}
 ORIGINAL TITLE: ${title}
-Requirements: 900-1200 words, HTML format (h2/h3/p/strong/ul), no markdown.
+Requirements: 600-900 words, HTML format (h2/h3/p/strong/ul), no markdown.
 Output pure JSON: {"title":"...","content":"...","meta_description":"...","focus_keyword":"...","keywords":["kw1","kw2","kw3","kw4","kw5"]}`;
     const result = await callAI(prompt, lang);
     if (result && validateOutput(result, lang)) return result;
+
+    // Fallback: prompt đơn giản hơn nếu fail lần đầu
+    console.log(`   ⚠️  [${lang}] Trying simplified fallback prompt...`);
+    const fallback = `You are a cricket journalist. Write a short cricket news article in ${lang} language.
+${langMap[lang]}
+Topic: ${title}
+Key facts: ${facts?.key_players?.join(', ') || title}
+Output JSON only: {"title":"[title in ${lang}]","content":"[300+ words HTML in ${lang}]","meta_description":"[desc in ${lang}]","focus_keyword":"[keyword]","keywords":["kw1","kw2","kw3"]}`;
+    const r2 = await callAI(fallback, lang);
+    if (r2 && validateOutput(r2, lang)) return r2;
     return null;
 }
 
