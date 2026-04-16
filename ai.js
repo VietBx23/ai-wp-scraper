@@ -12,15 +12,16 @@ const aiConfig = {
     groq:      [process.env.GROQ_KEY_1,      process.env.GROQ_KEY_2].filter(Boolean),
     cohere:    [process.env.COHERE_KEY_1,    process.env.COHERE_KEY_2].filter(Boolean),
     hf:        [process.env.HF_KEY_1,        process.env.HF_KEY_2].filter(Boolean),
+    gemini:    [process.env.GEMINI_API_KEY].filter(Boolean),
 };
 
 function getProviders() {
     const list = [];
-    aiConfig.sambanova.forEach((k, i) => list.push({ name: `SAMBANOVA_${i+1}`, type: 'openai', url: 'https://api.sambanova.ai/v1/chat/completions',   model: 'Meta-Llama-3.3-70B-Instruct', key: k }));
-    aiConfig.groq.forEach((k, i)      => list.push({ name: `GROQ_${i+1}`,      type: 'openai', url: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.3-70b-versatile',     key: k }));
-    aiConfig.cerebras.forEach((k, i)  => list.push({ name: `CEREBRAS_${i+1}`,  type: 'openai', url: 'https://api.cerebras.ai/v1/chat/completions',     model: 'llama3.1-8b',                 key: k }));
-    aiConfig.cohere.forEach((k, i)    => list.push({ name: `COHERE_${i+1}`,    type: 'cohere', url: 'https://api.cohere.com/v2/chat',                  model: 'command-r-plus',              key: k }));
-    aiConfig.hf.forEach((k, i)        => list.push({ name: `HF_${i+1}`,        type: 'sdk',    model: 'Qwen/Qwen2.5-72B-Instruct',                     key: k }));
+    aiConfig.groq.forEach((k, i)      => list.push({ name: `GROQ_${i+1}`,      type: 'openai', url: 'https://api.groq.com/openai/v1/chat/completions',      model: 'llama-3.3-70b-versatile',     key: k }));
+    aiConfig.sambanova.forEach((k, i) => list.push({ name: `SAMBANOVA_${i+1}`, type: 'openai', url: 'https://api.sambanova.ai/v1/chat/completions',          model: 'Meta-Llama-3.3-70B-Instruct', key: k }));
+    aiConfig.cerebras.forEach((k, i)  => list.push({ name: `CEREBRAS_${i+1}`,  type: 'openai', url: 'https://api.cerebras.ai/v1/chat/completions',           model: 'llama3.1-8b',                 key: k }));
+    aiConfig.cohere.forEach((k, i)    => list.push({ name: `COHERE_${i+1}`,    type: 'cohere', url: 'https://api.cohere.com/v2/chat',                        model: 'command-r-plus',              key: k }));
+    aiConfig.hf.forEach((k, i)        => list.push({ name: `HF_${i+1}`,        type: 'sdk',    model: 'Qwen/Qwen2.5-72B-Instruct',                           key: k }));
     return list;
 }
 
@@ -60,6 +61,7 @@ async function callAI(prompt, lang = 'English', idx = 0) {
     if (idx >= providers.length) { console.error('❌ All AI providers failed'); return null; }
     const ai = providers[idx];
     if (!ai.key) return callAI(prompt, lang, idx + 1);
+    console.log(`   [AI] Trying ${ai.name}...`);
     try {
         let text = '';
         if (ai.type === 'openai') {
@@ -76,6 +78,12 @@ async function callAI(prompt, lang = 'English', idx = 0) {
                 response_format: { type: 'json_object' }
             }, { headers: { Authorization: `Bearer ${ai.key}`, 'Content-Type': 'application/json' }, timeout: 40000 });
             text = res.data.message?.content?.[0]?.text || '';
+        } else if (ai.type === 'gemini') {
+            const res = await axios.post(ai.url, {
+                contents: [{ parts: [{ text: 'Output pure valid JSON only.\n\n' + prompt }] }],
+                generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 4000 }
+            }, { timeout: 40000 });
+            text = res.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } else {
             const hf = new HfInference(ai.key);
             const res = await hf.chatCompletion({ model: ai.model, messages: [{ role: 'system', content: 'Output pure valid JSON only.' }, { role: 'user', content: prompt }], max_tokens: 4000 });
@@ -83,11 +91,14 @@ async function callAI(prompt, lang = 'English', idx = 0) {
         }
         const parsed = cleanAndParseJSON(text);
         if (parsed) return parsed;
+        console.log(`   [AI] ${ai.name} returned invalid JSON, trying next...`);
         return callAI(prompt, lang, idx + 1);
     } catch (e) {
         const msg = e.message || '';
+        const status = e.response?.status;
+        console.log(`   [AI] ${ai.name} failed: ${status || ''} ${msg.slice(0, 80)}`);
         if (!msg.includes('depleted') && !msg.includes('credits')) {
-            if (e.response?.status === 429 || msg.includes('rate')) await new Promise(r => setTimeout(r, 2000));
+            if (status === 429 || msg.includes('rate')) await new Promise(r => setTimeout(r, 5000));
         }
         return callAI(prompt, lang, idx + 1);
     }
