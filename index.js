@@ -4,6 +4,7 @@ const { startWorker } = require('./worker');
 
 const espn            = require('./sources/espn');
 const bdcrictime      = require('./sources/bdcrictime');
+const bdcrictimeWeb   = require('./sources/bdcrictime_web');
 const cricketaddictor = require('./sources/cricketaddictor');
 const crictoday       = require('./sources/crictoday');
 
@@ -17,6 +18,7 @@ async function runCrawlCycle() {
     try {
         await espn.run().catch(e            => console.error('[ESPN] Fatal:', e.message));
         await bdcrictime.run().catch(e      => console.error('[BDCric] Fatal:', e.message));
+        await bdcrictimeWeb.run().catch(e   => console.error('[BDCricWeb] Fatal:', e.message));
         await cricketaddictor.run().catch(e => console.error('[CricketAddictor] Fatal:', e.message));
         await crictoday.run().catch(e       => console.error('[CricToday] Fatal:', e.message));
     } catch (e) {
