@@ -77,8 +77,9 @@ async function run() {
 
         for (const item of items) {
             if (count >= MAX) break;
-            const exists = await Article.findOne({ $or: [{ source_url: item.url }, { origin_id: item.url }] });
-            if (exists) continue;
+            // Chỉ check origin_id (URL) — tránh false positive với source_url từ BDCric API
+            const exists = await Article.findOne({ origin_id: item.url });
+            if (exists) { console.log(`[BDCricWeb] Already exists: ${item.url.slice(-50)}`); continue; }
 
             const detail = await scrapeDetail(item.url);
             if (!detail) continue;
