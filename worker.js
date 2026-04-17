@@ -2,7 +2,7 @@ const db = require('./db');
 const Article = require('./article');
 const { rewriteAllLanguages } = require('./ai');
 
-const BATCH_SIZE    = parseInt(process.env.WORKER_BATCH_SIZE) || 2;
+const BATCH_SIZE    = parseInt(process.env.WORKER_BATCH_SIZE) || 4;
 const POLL_INTERVAL = parseInt(process.env.WORKER_POLL_MS)    || 20000;
 const MAX_RETRIES   = 3;
 
@@ -90,7 +90,7 @@ async function runCycle() {
         console.log(`\n[Worker] Processing ${jobs.length} pending articles...`);
         for (const job of jobs) {
             await processOne(job);
-            await new Promise(r => setTimeout(r, 5000)); // 5s giữa các articles tránh rate limit
+            await new Promise(r => setTimeout(r, 2000));
         }
     } catch (e) {
         if (e.message?.includes('closed state') || e.message?.includes('connection')) {

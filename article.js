@@ -46,14 +46,14 @@ const Article = {
         const [result] = await db.query(
             `INSERT INTO articles
              (origin_id, language, source_url, title_raw, content_raw,
-              slug, featured_image, author, post_date, category, status, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+              slug, featured_image, author, post_date, category, status, flow, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
             [
                 data.origin_id || null, data.language || 'English', data.source_url || null,
                 data.title_raw || null, data.content_raw || null,
                 slug, data.featured_image || null, data.author || 'Admin',
                 toDatetime(data.post_date), data.category || 'Cricket News',
-                'pending',
+                'pending', data.flow || 1,
             ]
         );
         return { id: result.insertId, ...data };
@@ -78,13 +78,17 @@ const Article = {
                 id,
             ]
         );
+        // if (ai.keywords?.length) {
+        //     for (const kw of ai.keywords) {
+        //         if (kw) await db.query(
+        //             `INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES (?,?)`,
+        //             [id, String(kw).slice(0, 255)]
+        //         );
+        //     }
+        // }
         if (ai.keywords?.length) {
-            for (const kw of ai.keywords) {
-                if (kw) await db.query(
-                    `INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES (?,?)`,
-                    [id, String(kw).slice(0, 255)]
-                );
-            }
+            const values = ai.keywords.filter(k => k).map(kw => [id, String(kw).slice(0, 255)]);
+            await db.query(`INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES ?`, [values]);
         }
     },
 
