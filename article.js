@@ -27,17 +27,25 @@ async function getTopics() {
     return rows;
 }
 
-// Match title/category với topic trong DB
-async function matchTopic(title, category) {
+// Cache topic_id theo origin_id — 1 bài gốc = 1 topic duy nhất cho tất cả ngôn ngữ
+const _originTopicCache = new Map();
+
+async function matchTopic(originId, title, category) {
+    // Nếu đã match rồi thì dùng lại
+    if (_originTopicCache.has(originId)) return _originTopicCache.get(originId);
+
     const topics = await getTopics();
     const text = `${title} ${category}`.toLowerCase();
+    let matched = null;
     for (const topic of topics) {
         const keywords = topic.name.toLowerCase().split(/[\s,\/]+/);
         if (keywords.some(kw => kw.length > 2 && text.includes(kw))) {
-            return topic.id;
+            matched = topic.id;
+            break;
         }
     }
-    return null;
+    _originTopicCache.set(originId, matched);
+    return matched;
 }
 
 const Article = {
@@ -94,8 +102,8 @@ const Article = {
     async createPending(data) {
         const slug = slugify(data.title_raw || `article-${Date.now()}`);
 
-        // Auto-match topic nếu chưa có
-        const topic_id = data.topic_id || await matchTopic(data.title_raw || '', data.category || '');
+        // Auto-match topic 1 lần theo origin_id — share cho tất cả ngôn ngữ
+        const topic_id = data.topic_id || await matchTopic(data.origin_id, data.title_raw || '', data.category || '');
 
         // INSERT IGNORE — nếu (origin_id, language) đã tồn tại thì bỏ qua
         const [result] = await db.query(
@@ -124,29 +132,23 @@ const Article = {
      * Worker gọi hàm này sau khi AI xong
      * Update title_ai, content_ai, status: processed
      */
-    async updateAI(id, ai, titleRaw) {
-        // Dùng titleRaw (English) để tạo slug, không dùng title_ai (có thể là Urdu/Hindi/Bengali)
+    async updateAI(id, ai, titleRaw, topic_id = null, site_type_id = null) {
         const slug = slugify(titleRaw || ai.title);
         await db.query(
             `UPDATE articles SET
                 title_ai = ?, content_ai = ?, slug = ?,
                 meta_description = ?, focus_keyword = ?,
+                topic_id = COALESCE(?, topic_id),
+                site_type_id = COALESCE(?, site_type_id),
                 status = 'processed'
              WHERE id = ?`,
             [
                 ai.title, ai.content, slug,
                 ai.meta_description || null, ai.focus_keyword || null,
+                topic_id, site_type_id,
                 id,
             ]
         );
-        // if (ai.keywords?.length) {
-        //     for (const kw of ai.keywords) {
-        //         if (kw) await db.query(
-        //             `INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES (?,?)`,
-        //             [id, String(kw).slice(0, 255)]
-        //         );
-        //     }
-        // }
         if (ai.keywords?.length) {
             const values = ai.keywords.filter(k => k).map(kw => [id, String(kw).slice(0, 255)]);
             await db.query(`INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES ?`, [values]);

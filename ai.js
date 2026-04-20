@@ -134,15 +134,44 @@ OUTPUT pure JSON only:
 {
   "match": "teams and match info",
   "result": "match result or current status",
-  "key_players": ["player1 - what they did", "player2 - what they did"],
-  "key_stats": ["stat1", "stat2", "stat3"],
-  "key_moments": ["moment1", "moment2", "moment3"],
-  "context": "brief background/significance (2-3 sentences)",
+  "key_players": ["player1 - what they did"],
+  "key_stats": ["stat1", "stat2"],
+  "key_moments": ["moment1", "moment2"],
+  "context": "brief background (2-3 sentences)",
   "category": "IPL 2026 / Test Cricket / ODI / T20I"
 }
 ARTICLE TITLE: ${title}
 ARTICLE CONTENT: ${rawContent?.slice(0, 2500)}`;
     return await callMultiAI(prompt, 'English', 0);
+}
+
+// Classify topic và site type từ danh sách thực trong DB
+async function classifyArticle(rawContent, title, topics = [], siteTypes = []) {
+    const topicList    = topics.map(t => `"${t.name}"`).join(', ');
+    const siteTypeList = siteTypes.map(t => `"${t.name}"`).join(', ');
+
+    const prompt = `You are a content classifier. Read this cricket article and pick EXACTLY ONE topic and ONE site type from the lists below.
+
+AVAILABLE TOPICS (pick exactly one): [${topicList}]
+AVAILABLE SITE TYPES (pick exactly one): [${siteTypeList}]
+
+RULES:
+- You MUST return a value from the list above, do NOT invent new ones
+- Pick the most relevant match based on article content
+- If unsure about topic, pick the closest match
+- If unsure about site type, pick the closest match
+
+OUTPUT pure JSON only:
+{
+  "topic": "exact name from AVAILABLE TOPICS list",
+  "site_type": "exact name from AVAILABLE SITE TYPES list"
+}
+
+ARTICLE TITLE: ${title}
+ARTICLE CONTENT: ${rawContent?.slice(0, 1500)}`;
+
+    const result = await callMultiAI(prompt, 'English', 0);
+    return result;
 }
 
 async function writeArticleFromFacts(facts, originalTitle, targetLanguage) {
@@ -200,9 +229,23 @@ CONTENT: ${postContent?.slice(0, 2000)}`;
     return null;
 }
 
-async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu']) {
-    console.log(`   📊 Analyzing article (once for all languages)...`);
-    const facts = await analyzeArticle(content, title);
+async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu'], topics = [], siteTypes = []) {
+    console.log(`   📊 Analyzing + classifying article in parallel...`);
+
+    // Chạy song song: analyze facts + classify topic/type
+    const [facts, classification] = await Promise.all([
+        analyzeArticle(content, title),
+        (topics.length && siteTypes.length)
+            ? classifyArticle(content, title, topics, siteTypes)
+            : Promise.resolve(null)
+    ]);
+
+    const best_topic     = classification?.topic     || null;
+    const best_site_type = classification?.site_type || null;
+
+    if (best_topic)     console.log(`   🏷️  Topic:     ${best_topic}`);
+    if (best_site_type) console.log(`   🏷️  Site Type: ${best_site_type}`);
+
     const results = {};
     for (const lang of langs) {
         console.log(`   ✍️  Writing [${lang}]...`);
@@ -217,7 +260,8 @@ async function rewriteAllLanguages(content, title, image, langs = ['English', 'H
         }
         await new Promise(r => setTimeout(r, 2000));
     }
-    return results;
+
+    return { articles: results, best_topic, best_site_type };
 }
 
-module.exports = { rewriteAllLanguages };
+module.exports = { rewriteAllLanguages, analyzeArticle, classifyArticle };
