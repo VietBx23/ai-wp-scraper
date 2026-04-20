@@ -1,6 +1,6 @@
 const db = require('./db');
 const Article = require('./article');
-const { rewriteAllLanguages } = require('./ai');
+const { rewriteAllLanguages, classifyArticle } = require('./ai');
 
 const BATCH_SIZE    = parseInt(process.env.WORKER_BATCH_SIZE) || 4;
 const POLL_INTERVAL = parseInt(process.env.WORKER_POLL_MS)    || 20000;
@@ -9,22 +9,46 @@ const MAX_RETRIES   = 3;
 let isWorking = false;
 const retryCount = new Map();
 
-// Cache topics và site_types từ DB
+// Cache classification theo origin_id — 1 bài gốc = 1 topic/type cho tất cả ngôn ngữ
+const _classifyCache = new Map();
+
+async function getClassification(originId, contentRaw, titleRaw, topics, siteTypes) {
+    if (_classifyCache.has(originId)) return _classifyCache.get(originId);
+
+    const result = await classifyArticle(contentRaw, titleRaw, topics, siteTypes);
+
+    let topic_id = null, site_type_id = null;
+    if (result?.topic) {
+        const t = topics.find(t => t.name.toLowerCase() === result.topic.toLowerCase().trim());
+        if (t) topic_id = t.id;
+        else console.warn(`   ⚠️ Topic "${result.topic}" not in DB`);
+    }
+    if (result?.site_type) {
+        const st = siteTypes.find(s => s.name.toLowerCase() === result.site_type.toLowerCase().trim());
+        if (st) site_type_id = st.id;
+        else console.warn(`   ⚠️ SiteType "${result.site_type}" not in DB`);
+    }
+
+    const classification = { topic_id, site_type_id };
+    _classifyCache.set(originId, classification);
+    setTimeout(() => _classifyCache.delete(originId), 60 * 60 * 1000);
+    console.log(`   🏷️  [Classify] topic_id=${topic_id} site_type_id=${site_type_id}`);
+    return classification;
+}
+
+// Cache topics và site_types từ DB, refresh mỗi 15 phút
 let _metaCache = null;
 async function getMeta() {
     if (_metaCache) return _metaCache;
     const [topics]    = await db.query(`SELECT id, name FROM topics WHERE is_active = 1`);
     const [siteTypes] = await db.query(`SELECT id, name FROM site_types WHERE is_active = 1`);
     _metaCache = { topics, siteTypes };
-    // Reset cache mỗi 15 phút
     setTimeout(() => { _metaCache = null; }, 15 * 60 * 1000);
     return _metaCache;
 }
 
-// Lấy 1 interlink từ link_inventory của site Tier 3 khác, cùng topic
 async function getInterlink(topic_id, language) {
     try {
-        // Lấy 1 link active từ site Tier 3, cùng language, cùng topic (nếu có), chưa dùng gần đây
         const [rows] = await db.query(
             `SELECT li.url, li.anchor_text
              FROM link_inventory li
@@ -46,15 +70,11 @@ async function getInterlink(topic_id, language) {
     }
 }
 
-// Gắn interlink vào cuối content trước thẻ đóng cuối cùng
 function injectBacklink(content, link) {
     if (!link || !link.url || !link.anchor_text) return content;
-    const backlinkHtml = `\n<p><a href="${link.url}" title="${link.anchor_text}">${link.anchor_text}</a></p>`;
-    // Gắn trước </article> hoặc cuối content
-    if (content.includes('</article>')) {
-        return content.replace('</article>', backlinkHtml + '</article>');
-    }
-    return content + backlinkHtml;
+    const html = `\n<p><a href="${link.url}" title="${link.anchor_text}">${link.anchor_text}</a></p>`;
+    if (content.includes('</article>')) return content.replace('</article>', html + '</article>');
+    return content + html;
 }
 
 async function claimBatch() {
@@ -62,7 +82,7 @@ async function claimBatch() {
     try {
         await conn.beginTransaction();
         const [rows] = await conn.query(
-            `SELECT id, origin_id, language, title_raw, content_raw, featured_image, topic_id, category
+            `SELECT id, origin_id, language, title_raw, content_raw, featured_image, topic_id, site_type_id, category
              FROM articles WHERE status = 'pending'
              ORDER BY created_at ASC LIMIT ?
              FOR UPDATE SKIP LOCKED`,
@@ -89,17 +109,25 @@ async function processOne(article) {
     const key = article.id;
     const attempts = (retryCount.get(key) || 0) + 1;
     retryCount.set(key, attempts);
-
     console.log(`[Worker] [${article.language}] attempt ${attempts}/${MAX_RETRIES}: "${article.title_raw?.slice(0, 55)}"`);
 
     try {
         const { topics, siteTypes } = await getMeta();
 
+        // Classify 1 lần theo origin_id — share cho tất cả 4 ngôn ngữ
+        let topic_id     = article.topic_id     || null;
+        let site_type_id = article.site_type_id || null;
+        if (!topic_id || !site_type_id) {
+            const cls = await getClassification(article.origin_id, article.content_raw, article.title_raw, topics, siteTypes);
+            if (!topic_id)     topic_id     = cls.topic_id;
+            if (!site_type_id) site_type_id = cls.site_type_id;
+        }
+
+        // Rewrite content
         const result = await rewriteAllLanguages(
             article.content_raw, article.title_raw, article.featured_image,
-            [article.language], topics, siteTypes
+            [article.language]
         );
-
         const ai = result.articles[article.language];
 
         if (!ai) {
@@ -112,24 +140,7 @@ async function processOne(article) {
             return;
         }
 
-        // Resolve topic_id và site_type_id từ tên AI trả về — validate chính xác với DB
-        let topic_id     = article.topic_id || null;
-        let site_type_id = article.site_type_id || null;
-
-        if (!topic_id && result.best_topic) {
-            const t = topics.find(t => t.name.toLowerCase() === result.best_topic.toLowerCase().trim());
-            if (t) { topic_id = t.id; }
-            else console.warn(`   ⚠️ Topic "${result.best_topic}" not found in DB, skipping`);
-        }
-        if (!site_type_id && result.best_site_type) {
-            const st = siteTypes.find(s => s.name.toLowerCase() === result.best_site_type.toLowerCase().trim());
-            if (st) { site_type_id = st.id; }
-            else console.warn(`   ⚠️ SiteType "${result.best_site_type}" not found in DB, skipping`);
-        }
-
-        console.log(`   🏷️  topic_id=${topic_id} site_type_id=${site_type_id}`);
-
-        // Gắn 1 interlink vào content
+        // Gắn 1 interlink
         const interlink = await getInterlink(topic_id, article.language);
         if (interlink) {
             ai.content = injectBacklink(ai.content, interlink);

@@ -229,22 +229,9 @@ CONTENT: ${postContent?.slice(0, 2000)}`;
     return null;
 }
 
-async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu'], topics = [], siteTypes = []) {
-    console.log(`   📊 Analyzing + classifying article in parallel...`);
-
-    // Chạy song song: analyze facts + classify topic/type
-    const [facts, classification] = await Promise.all([
-        analyzeArticle(content, title),
-        (topics.length && siteTypes.length)
-            ? classifyArticle(content, title, topics, siteTypes)
-            : Promise.resolve(null)
-    ]);
-
-    const best_topic     = classification?.topic     || null;
-    const best_site_type = classification?.site_type || null;
-
-    if (best_topic)     console.log(`   🏷️  Topic:     ${best_topic}`);
-    if (best_site_type) console.log(`   🏷️  Site Type: ${best_site_type}`);
+async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu']) {
+    console.log(`   📊 Analyzing article...`);
+    const facts = await analyzeArticle(content, title);
 
     const results = {};
     for (const lang of langs) {
@@ -261,7 +248,7 @@ async function rewriteAllLanguages(content, title, image, langs = ['English', 'H
         await new Promise(r => setTimeout(r, 2000));
     }
 
-    return { articles: results, best_topic, best_site_type };
+    return { articles: results };
 }
 
 module.exports = { rewriteAllLanguages, analyzeArticle, classifyArticle };
