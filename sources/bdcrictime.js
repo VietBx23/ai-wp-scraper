@@ -20,6 +20,7 @@ async function run() {
                 const exists = await Article.findOne({ $or: [{ origin_id: String(item.ID) }, { source_url: item.guid }] });
                 if (exists) continue;
                 const content = he.decode(item.post_content || '');
+                if (await Article.isTitleDuplicate(item.post_title)) continue;
                 for (const lang of LANGS) {
                     await Article.createPending({
                         origin_id: String(item.ID), source_url: item.guid, language: lang,

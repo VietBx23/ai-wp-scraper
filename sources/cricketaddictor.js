@@ -56,6 +56,7 @@ async function run() {
             if (exists) continue;
             const detail = await scrapeDetail(url);
             if (!detail) continue;
+            if (await Article.isTitleDuplicate(detail.title)) continue;
             for (const lang of LANGS) {
                 await Article.createPending({
                     origin_id: url, source_url: url, language: lang,

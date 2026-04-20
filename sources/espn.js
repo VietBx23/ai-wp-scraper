@@ -71,6 +71,7 @@ async function run() {
             if (exists) continue;
             const detail = await scrapeDetail(url);
             if (!detail) continue;
+            if (await Article.isTitleDuplicate(detail.title)) continue;
             // Insert pending cho mỗi ngôn ngữ — AI worker xử lý sau
             for (const lang of LANGS) {
                 await Article.createPending({

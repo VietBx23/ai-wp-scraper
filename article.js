@@ -38,6 +38,30 @@ const Article = {
     },
 
     /**
+     * Check title similarity trước khi crawl — tránh trùng nội dung từ nhiều nguồn
+     * Trả về true nếu đã có bài tương tự hôm nay
+     */
+    async isTitleDuplicate(newTitle, threshold = 0.6) {
+        const today = new Date().toISOString().slice(0, 10);
+        const [rows] = await db.query(
+            `SELECT title_raw FROM articles WHERE DATE(created_at) = ? AND language = 'English' AND title_raw IS NOT NULL`,
+            [today]
+        );
+        const normalize = t => t.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
+        const newWords = new Set(normalize(newTitle));
+        for (const { title_raw } of rows) {
+            const existWords = new Set(normalize(title_raw));
+            const intersection = [...newWords].filter(w => existWords.has(w)).length;
+            const union = new Set([...newWords, ...existWords]).size;
+            if (union > 0 && intersection / union >= threshold) {
+                console.log(`   [DupCheck] Similar title skipped: "${newTitle.slice(0, 60)}"`);
+                return true;
+            }
+        }
+        return false;
+    },
+
+    /**
      * Crawlers gọi hàm này — insert raw content, status: pending
      * Chưa có title_ai/content_ai, worker sẽ xử lý sau
      */
