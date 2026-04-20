@@ -15,6 +15,31 @@ function toDatetime(d) {
     return isNaN(dt) ? null : dt.toISOString().slice(0, 19).replace('T', ' ');
 }
 
+// Cache topics từ DB, refresh mỗi 10 phút
+let _topicCache = null;
+let _topicCacheTime = 0;
+
+async function getTopics() {
+    if (_topicCache && Date.now() - _topicCacheTime < 10 * 60 * 1000) return _topicCache;
+    const [rows] = await db.query(`SELECT id, name, slug FROM topics WHERE is_active = 1`);
+    _topicCache = rows;
+    _topicCacheTime = Date.now();
+    return rows;
+}
+
+// Match title/category với topic trong DB
+async function matchTopic(title, category) {
+    const topics = await getTopics();
+    const text = `${title} ${category}`.toLowerCase();
+    for (const topic of topics) {
+        const keywords = topic.name.toLowerCase().split(/[\s,\/]+/);
+        if (keywords.some(kw => kw.length > 2 && text.includes(kw))) {
+            return topic.id;
+        }
+    }
+    return null;
+}
+
 const Article = {
     async findOne(where) {
         const parts = [], params = [];
@@ -43,8 +68,9 @@ const Article = {
      */
     async isTitleDuplicate(newTitle, threshold = 0.6) {
         const today = new Date().toISOString().slice(0, 10);
+        // Check tất cả ngôn ngữ, chỉ cần 1 bài English trùng là đủ để skip
         const [rows] = await db.query(
-            `SELECT title_raw FROM articles WHERE DATE(created_at) = ? AND language = 'English' AND title_raw IS NOT NULL`,
+            `SELECT title_raw FROM articles WHERE DATE(created_at) = ? AND title_raw IS NOT NULL GROUP BY title_raw`,
             [today]
         );
         const normalize = t => t.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
@@ -67,20 +93,31 @@ const Article = {
      */
     async createPending(data) {
         const slug = slugify(data.title_raw || `article-${Date.now()}`);
+
+        // Auto-match topic nếu chưa có
+        const topic_id = data.topic_id || await matchTopic(data.title_raw || '', data.category || '');
+
+        // INSERT IGNORE — nếu (origin_id, language) đã tồn tại thì bỏ qua
         const [result] = await db.query(
-            `INSERT INTO articles
+            `INSERT IGNORE INTO articles
              (origin_id, language, source_url, title_raw, content_raw,
-              slug, featured_image, author, post_date, category, status, flow, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+              slug, featured_image, author, post_date, category, topic_id, status, flow, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
             [
                 data.origin_id || null, data.language || 'English', data.source_url || null,
                 data.title_raw || null, data.content_raw || null,
                 slug, data.featured_image || null, data.author || 'Admin',
                 toDatetime(data.post_date), data.category || 'Cricket News',
+                topic_id,
                 'pending', data.flow || 1,
             ]
         );
-        return { id: result.insertId, ...data };
+        if (result.affectedRows === 0) {
+            console.log(`   [Skip] Already exists: origin_id=${data.origin_id} lang=${data.language}`);
+            return null;
+        }
+        if (topic_id) console.log(`   [Topic] Matched topic_id=${topic_id} for "${data.title_raw?.slice(0,50)}"`);
+        return { id: result.insertId, ...data, topic_id };
     },
 
     /**
