@@ -174,19 +174,29 @@ ARTICLE CONTENT: ${rawContent?.slice(0, 1500)}`;
     return result;
 }
 
-async function writeArticleFromFacts(facts, originalTitle, targetLanguage) {
+async function writeArticleFromFacts(facts, originalTitle, targetLanguage, interlink = null) {
     const langInstructions = {
         'English': 'Write in fluent, engaging British/American English.',
         'Hindi':   'हिंदी में लिखें। भारतीय क्रिकेट प्रशंसकों के लिए उत्साहजनक शैली में।',
         'Bengali': 'বাংলায় লিখুন। বাংলাদেশ ও পশ্চিমবঙ্গের পাঠকদের জন্য আকর্ষণীয় করুন।',
         'Urdu':    'اردو میں لکھیں۔ پاکستانی شائقین کے لیے پرجوش انداز میں۔'
     };
+
+    const interlinkInstruction = interlink
+        ? `INTERLINK REQUIREMENT (MANDATORY):
+- You MUST naturally embed this link once inside the article body, within a relevant sentence or paragraph.
+- Use the anchor text as the clickable text, do NOT place it in a standalone <p> tag.
+- Example: <a href="${interlink.url}" title="${interlink.anchor_text}" rel="dofollow">${interlink.anchor_text}</a>
+- Place it where it reads naturally in context, around the middle of the article.`
+        : '';
+
     const prompt = `You are an elite Sports Journalist. Write a complete SEO-optimized cricket article in ${targetLanguage}.
 LANGUAGE INSTRUCTION: ${langInstructions[targetLanguage] || langInstructions['English']}
 WRITE ENTIRELY IN ${targetLanguage}. Every word must be in ${targetLanguage}.
 KEY FACTS TO USE:
 ${JSON.stringify(facts, null, 2)}
 ORIGINAL TITLE (for reference): ${originalTitle}
+${interlinkInstruction}
 ARTICLE REQUIREMENTS:
 - 900-1200 words
 - Engaging, viral-worthy sports writing
@@ -206,15 +216,26 @@ OUTPUT pure JSON only:
     return null;
 }
 
-async function writeDirect(postContent, title, targetLanguage) {
+async function writeDirect(postContent, title, targetLanguage, interlink = null) {
     const langInstructions = {
         'English': 'Write in fluent English.',
         'Hindi':   'हिंदी में लिखें।',
         'Bengali': 'বাংলায় লিখুন।',
         'Urdu':    'اردو میں لکھیں۔'
     };
+
+    const interlinkInstruction = interlink
+        ? `INTERLINK REQUIREMENT (MANDATORY):
+- Naturally embed this link once inside the article body within a relevant sentence.
+- Use the anchor text as clickable text, do NOT place it in a standalone <p> tag.
+- Example: <a href="${interlink.url}" title="${interlink.anchor_text}" rel="dofollow">${interlink.anchor_text}</a>
+- Place it where it reads naturally in context, around the middle of the article.`
+        : '';
+
     const prompt = `Rewrite this cricket article in ${targetLanguage}. ${langInstructions[targetLanguage] || ''}
-Write ENTIRELY in ${targetLanguage}. Output pure JSON only:
+Write ENTIRELY in ${targetLanguage}.
+${interlinkInstruction}
+Output pure JSON only:
 {
   "title": "SEO title in ${targetLanguage}",
   "content": "HTML article in ${targetLanguage} (min 600 words)",
@@ -229,21 +250,21 @@ CONTENT: ${postContent?.slice(0, 2000)}`;
     return null;
 }
 
-async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu']) {
+async function rewriteAllLanguages(content, title, image, langs = ['English', 'Hindi', 'Bengali', 'Urdu'], interlink = null) {
     console.log(`   📊 Analyzing article...`);
     const facts = await analyzeArticle(content, title);
 
     const results = {};
     for (const lang of langs) {
-        console.log(`   ✍️  Writing [${lang}]...`);
+        console.log(`   ✍️  Writing [${lang}]${interlink ? ' + interlink' : ''}...`);
         if (facts) {
-            results[lang] = await writeArticleFromFacts(facts, title, lang);
+            results[lang] = await writeArticleFromFacts(facts, title, lang, interlink);
             if (!results[lang]) {
                 console.warn(`   ⚠️ [${lang}] facts write failed, trying direct...`);
-                results[lang] = await writeDirect(content, title, lang);
+                results[lang] = await writeDirect(content, title, lang, interlink);
             }
         } else {
-            results[lang] = await writeDirect(content, title, lang);
+            results[lang] = await writeDirect(content, title, lang, interlink);
         }
         await new Promise(r => setTimeout(r, 2000));
     }

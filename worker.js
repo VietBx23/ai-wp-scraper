@@ -70,9 +70,25 @@ async function getInterlink(topic_id, language) {
     }
 }
 
+// Inject backlink vào giữa bài — sau thẻ </p> thứ 3 để tự nhiên hơn
 function injectBacklink(content, link) {
     if (!link || !link.url || !link.anchor_text) return content;
-    const html = `\n<p><a href="${link.url}" title="${link.anchor_text}">${link.anchor_text}</a></p>`;
+    const html = `\n<p><a href="${link.url}" title="${link.anchor_text}" rel="dofollow">${link.anchor_text}</a></p>`;
+
+    // Tìm vị trí sau </p> thứ 3
+    let count = 0, pos = -1, idx = 0;
+    while (count < 3) {
+        idx = content.indexOf('</p>', idx);
+        if (idx === -1) break;
+        pos = idx + 4; // sau </p>
+        count++;
+        idx = pos;
+    }
+
+    if (pos !== -1) {
+        return content.slice(0, pos) + html + content.slice(pos);
+    }
+    // fallback: append trước </article> hoặc cuối
     if (content.includes('</article>')) return content.replace('</article>', html + '</article>');
     return content + html;
 }
@@ -81,13 +97,30 @@ async function claimBatch() {
     const conn = await db.getConnection();
     try {
         await conn.beginTransaction();
-        const [rows] = await conn.query(
-            `SELECT id, origin_id, language, title_raw, content_raw, featured_image, topic_id, site_type_id, category
-             FROM articles WHERE status = 'pending'
-             ORDER BY created_at ASC LIMIT ?
-             FOR UPDATE SKIP LOCKED`,
+
+        // Lấy BATCH_SIZE origin_id distinct có bài pending — đảm bảo group đủ 4 ngôn ngữ
+        const [originRows] = await conn.query(
+            `SELECT origin_id FROM articles
+             WHERE status = 'pending'
+             GROUP BY origin_id
+             ORDER BY MIN(created_at) ASC
+             LIMIT ?`,
             [BATCH_SIZE]
         );
+        if (!originRows.length) { await conn.commit(); return []; }
+
+        const originIds = originRows.map(r => r.origin_id);
+
+        // Lấy TẤT CẢ bài của các origin_id đó (tức là tất cả ngôn ngữ)
+        const placeholders = originIds.map(() => '?').join(',');
+        const [rows] = await conn.query(
+            `SELECT id, origin_id, language, title_raw, content_raw, featured_image, topic_id, site_type_id, category
+             FROM articles
+             WHERE status = 'pending' AND origin_id IN (${placeholders})
+             FOR UPDATE SKIP LOCKED`,
+            originIds
+        );
+
         if (rows.length) {
             const ids = rows.map(r => r.id);
             await conn.query(
@@ -105,28 +138,27 @@ async function claimBatch() {
     }
 }
 
-async function processOne(article) {
+async function processOne(article, sharedClassification) {
     const key = article.id;
     const attempts = (retryCount.get(key) || 0) + 1;
     retryCount.set(key, attempts);
     console.log(`[Worker] [${article.language}] attempt ${attempts}/${MAX_RETRIES}: "${article.title_raw?.slice(0, 55)}"`);
 
     try {
-        const { topics, siteTypes } = await getMeta();
+        const { topic_id, site_type_id } = sharedClassification;
 
-        // Classify 1 lần theo origin_id — share cho tất cả 4 ngôn ngữ
-        let topic_id     = article.topic_id     || null;
-        let site_type_id = article.site_type_id || null;
-        if (!topic_id || !site_type_id) {
-            const cls = await getClassification(article.origin_id, article.content_raw, article.title_raw, topics, siteTypes);
-            if (!topic_id)     topic_id     = cls.topic_id;
-            if (!site_type_id) site_type_id = cls.site_type_id;
+        // Fetch interlink trước để AI tự chèn vào bài một cách tự nhiên
+        const interlink = await getInterlink(topic_id, article.language);
+        if (interlink) {
+            console.log(`   🔗 [Backlink] Will embed: ${interlink.url} | "${interlink.anchor_text}"`);
+        } else {
+            console.warn(`   ⚠️ [Backlink] No interlink found for topic_id=${topic_id} lang=${article.language}`);
         }
 
-        // Rewrite content
+        // Rewrite content — AI tự chèn interlink vào bài
         const result = await rewriteAllLanguages(
             article.content_raw, article.title_raw, article.featured_image,
-            [article.language]
+            [article.language], interlink
         );
         const ai = result.articles[article.language];
 
@@ -140,15 +172,23 @@ async function processOne(article) {
             return;
         }
 
-        // Gắn 1 interlink
-        const interlink = await getInterlink(topic_id, article.language);
-        if (interlink) {
-            ai.content = injectBacklink(ai.content, interlink);
-            console.log(`   🔗 [Backlink] Injected: ${interlink.url}`);
+        // Kiểm tra độ dài content — nếu quá ngắn thì retry để AI gen lại
+        const plainLength = ai.content?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().length || 0;
+        const MIN_CONTENT_LENGTH = parseInt(process.env.MIN_CONTENT_LENGTH) || 600;
+        if (plainLength < MIN_CONTENT_LENGTH) {
+            console.warn(`   ⚠️ [${article.language}] Content too short (${plainLength} chars < ${MIN_CONTENT_LENGTH}) — retry`);
+            if (attempts < MAX_RETRIES) {
+                await Article.updateStatus(article.id, 'pending');
+            } else {
+                console.error(`   ❌ [${article.language}] Still too short after ${MAX_RETRIES} attempts — marking ai_error`);
+                await Article.updateStatus(article.id, 'ai_error');
+                retryCount.delete(key);
+            }
+            return;
         }
 
         await Article.updateAI(article.id, ai, article.title_raw, topic_id, site_type_id);
-        console.log(`   ✅ [${article.language}] ${ai.title.slice(0, 60)}`);
+        console.log(`   ✅ [${article.language}] topic_id=${topic_id} site_type_id=${site_type_id} | ${ai.title.slice(0, 60)}`);
         retryCount.delete(key);
     } catch (e) {
         console.error(`   ❌ [${article.language}] Error: ${e.message}`);
@@ -167,10 +207,56 @@ async function runCycle() {
     try {
         const jobs = await claimBatch();
         if (!jobs.length) return;
-        console.log(`\n[Worker] Processing ${jobs.length} pending articles...`);
+
+        // Group theo origin_id — đảm bảo 4 ngôn ngữ cùng origin dùng chung 1 classification
+        const groups = new Map();
         for (const job of jobs) {
-            await processOne(job);
-            await new Promise(r => setTimeout(r, 2000));
+            if (!groups.has(job.origin_id)) groups.set(job.origin_id, []);
+            groups.get(job.origin_id).push(job);
+        }
+
+        console.log(`\n[Worker] Processing ${jobs.length} articles across ${groups.size} origin(s)...`);
+
+        const { topics, siteTypes } = await getMeta();
+
+        for (const [originId, articles] of groups) {
+            // Classify 1 lần duy nhất cho cả nhóm
+            const rep = articles[0]; // đại diện để classify (dùng content_raw English nếu có)
+            const engRep = articles.find(a => a.language === 'English') || rep;
+
+            let topic_id     = engRep.topic_id     || null;
+            let site_type_id = engRep.site_type_id || null;
+
+            if (!topic_id || !site_type_id) {
+                const cls = await getClassification(originId, engRep.content_raw, engRep.title_raw, topics, siteTypes);
+                if (!topic_id)     topic_id     = cls.topic_id;
+                if (!site_type_id) site_type_id = cls.site_type_id;
+            }
+
+            if (!topic_id || !site_type_id) {
+                console.warn(`   ⚠️ [origin=${originId}] Could not classify — skipping ${articles.length} articles`);
+                for (const a of articles) await Article.updateStatus(a.id, 'pending');
+                continue;
+            }
+
+            console.log(`   🏷️  [origin=${originId}] topic_id=${topic_id} site_type_id=${site_type_id} → ${articles.length} lang(s)`);
+
+            // Sync classification vào DB cho TẤT CẢ bài trong nhóm ngay lập tức
+            // Đảm bảo 4 ngôn ngữ luôn có cùng topic_id và site_type_id
+            const ids = articles.map(a => a.id);
+            await db.query(
+                `UPDATE articles SET topic_id = ?, site_type_id = ?
+                 WHERE id IN (${ids.map(() => '?').join(',')})`,
+                [topic_id, site_type_id, ...ids]
+            );
+
+            const sharedClassification = { topic_id, site_type_id };
+
+            // Process từng ngôn ngữ trong nhóm với cùng classification
+            for (const article of articles) {
+                await processOne(article, sharedClassification);
+                await new Promise(r => setTimeout(r, 2000));
+            }
         }
     } catch (e) {
         if (e.message?.includes('closed state') || e.message?.includes('connection')) {

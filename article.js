@@ -98,25 +98,22 @@ const Article = {
     /**
      * Crawlers gọi hàm này — insert raw content, status: pending
      * Chưa có title_ai/content_ai, worker sẽ xử lý sau
+     * Không classify ở đây — để worker dùng AI classify chính xác hơn
      */
     async createPending(data) {
         const slug = slugify(data.title_raw || `article-${Date.now()}`);
-
-        // Auto-match topic 1 lần theo origin_id — share cho tất cả ngôn ngữ
-        const topic_id = data.topic_id || await matchTopic(data.origin_id, data.title_raw || '', data.category || '');
 
         // INSERT IGNORE — nếu (origin_id, language) đã tồn tại thì bỏ qua
         const [result] = await db.query(
             `INSERT IGNORE INTO articles
              (origin_id, language, source_url, title_raw, content_raw,
-              slug, featured_image, author, post_date, category, topic_id, status, flow, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+              slug, featured_image, author, post_date, category, status, flow, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
             [
                 data.origin_id || null, data.language || 'English', data.source_url || null,
                 data.title_raw || null, data.content_raw || null,
                 slug, data.featured_image || null, data.author || 'Admin',
                 toDatetime(data.post_date), data.category || 'Cricket News',
-                topic_id,
                 'pending', data.flow || 1,
             ]
         );
@@ -124,8 +121,7 @@ const Article = {
             console.log(`   [Skip] Already exists: origin_id=${data.origin_id} lang=${data.language}`);
             return null;
         }
-        if (topic_id) console.log(`   [Topic] Matched topic_id=${topic_id} for "${data.title_raw?.slice(0,50)}"`);
-        return { id: result.insertId, ...data, topic_id };
+        return { id: result.insertId, ...data };
     },
 
     /**
