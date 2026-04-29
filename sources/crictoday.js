@@ -4,7 +4,6 @@ const dayjs = require('dayjs');
 const Article = require('../article');
 
 const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
-const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0' };
 
 async function scrapeDetail(url) {
@@ -36,21 +35,23 @@ async function run() {
             if (!link) continue;
             if (!link.startsWith('http')) link = 'https://crictoday.com' + link;
             const originId = 'crictoday-' + link.split('/').filter(Boolean).pop();
-            const exists = await Article.findOne({ origin_id: originId });
-            if (exists) continue;
+            
+            // Check duplicate by source URL
+            if (await Article.isSourceDuplicate(link)) continue;
+            
             const detail = await scrapeDetail(link);
             if (!detail) continue;
             if (await Article.isTitleDuplicate(detail.title)) continue;
-            for (const lang of LANGS) {
-                await Article.createPending({
-                    origin_id: originId, source_url: link, language: lang,
-                    title_raw: detail.title, content_raw: detail.content,
-                    featured_image: detail.featured_image, author: 'CricToday',
-                    category: 'Cricket News', post_date: new Date(),
-                });
+            const queued = await Article.classifyAndQueue({
+                origin_id: originId, source_url: link,
+                title_raw: detail.title, content_raw: detail.content,
+                featured_image: detail.featured_image, author: 'CricToday',
+                category: 'Cricket News', post_date: new Date(),
+            });
+            if (queued > 0) {
+                console.log(`[CricToday] Queued (${queued} articles): ${detail.title.slice(0, 60)}`);
+                count++;
             }
-            console.log(`[CricToday] Queued: ${detail.title.slice(0, 60)}`);
-            count++;
         }
         console.log(`[CricToday] Done. ${count} articles queued.`);
     } catch (e) { console.error('[CricToday] Error:', e.message); }

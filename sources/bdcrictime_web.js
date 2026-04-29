@@ -77,29 +77,28 @@ async function run() {
 
         for (const item of items) {
             if (count >= MAX) break;
-            // Chỉ check origin_id (URL) — tránh false positive với source_url từ BDCric API
-            const exists = await Article.findOne({ origin_id: item.url });
-            if (exists) { console.log(`[BDCricWeb] Already exists: ${item.url.slice(-50)}`); continue; }
-
+            
+            // Check duplicate bằng source_url (sẽ được check trong classifyAndQueue)
             const detail = await scrapeDetail(item.url);
             if (!detail) continue;
-            if (await Article.isTitleDuplicate(detail.title)) continue;
 
-            for (const lang of LANGS) {
-                await Article.createPending({
-                    origin_id: item.url,
-                    source_url: item.url,
-                    language: lang,
-                    title_raw: detail.title,
-                    content_raw: detail.content,
-                    featured_image: detail.featured_image,
-                    author: detail.author,
-                    category: detail.category,
-                    post_date: new Date(),
-                });
+            // classifyAndQueue sẽ tự check duplicate và title similarity
+            const queued = await Article.classifyAndQueue({
+                source_url: item.url,
+                origin_id: item.url,
+                title_raw: detail.title,
+                content_raw: detail.content,
+                featured_image: detail.featured_image,
+                author: detail.author,
+                category: detail.category,
+                post_date: new Date(),
+            });
+
+            if (queued > 0) {
+                console.log(`[BDCricWeb] Queued: ${detail.title.slice(0, 60)} → ${queued} variants`);
+                count++;
             }
-            console.log(`[BDCricWeb] Queued: ${detail.title.slice(0, 60)}`);
-            count++;
+            
             await new Promise(r => setTimeout(r, 1000));
         }
         console.log(`[BDCricWeb] Done. ${count} articles queued.`);

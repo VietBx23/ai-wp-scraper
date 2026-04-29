@@ -15,70 +15,30 @@ function toDatetime(d) {
     return isNaN(dt) ? null : dt.toISOString().slice(0, 19).replace('T', ' ');
 }
 
-// Cache topics từ DB, refresh mỗi 10 phút
-let _topicCache = null;
-let _topicCacheTime = 0;
-
-async function getTopics() {
-    if (_topicCache && Date.now() - _topicCacheTime < 10 * 60 * 1000) return _topicCache;
-    const [rows] = await db.query(`SELECT id, name, slug FROM topics WHERE is_active = 1`);
-    _topicCache = rows;
-    _topicCacheTime = Date.now();
-    return rows;
-}
-
-// Cache topic_id theo origin_id — 1 bài gốc = 1 topic duy nhất cho tất cả ngôn ngữ
-const _originTopicCache = new Map();
-
-async function matchTopic(originId, title, category) {
-    // Nếu đã match rồi thì dùng lại
-    if (_originTopicCache.has(originId)) return _originTopicCache.get(originId);
-
-    const topics = await getTopics();
-    const text = `${title} ${category}`.toLowerCase();
-    let matched = null;
-    for (const topic of topics) {
-        const keywords = topic.name.toLowerCase().split(/[\s,\/]+/);
-        if (keywords.some(kw => kw.length > 2 && text.includes(kw))) {
-            matched = topic.id;
-            break;
-        }
-    }
-    _originTopicCache.set(originId, matched);
-    return matched;
-}
-
 const Article = {
-    async findOne(where) {
-        const parts = [], params = [];
-        for (const [k, v] of Object.entries(where)) {
-            if (k === '$or') {
-                const orParts = v.map(cond => {
-                    const [ck, cv] = Object.entries(cond)[0];
-                    params.push(cv);
-                    return `${ck} = ?`;
-                });
-                parts.push(`(${orParts.join(' OR ')})`);
-            } else {
-                parts.push(`${k} = ?`); params.push(v);
-            }
-        }
+
+    /**
+     * Check source_url đã tồn tại chưa — dùng UNIQUE index trên art_raw
+     */
+    async isSourceDuplicate(sourceUrl) {
         const [[row]] = await db.query(
-            `SELECT id, origin_id, language FROM articles WHERE ${parts.join(' AND ') || '1=1'} LIMIT 1`,
-            params
+            `SELECT id FROM art_raw WHERE source_url = ? LIMIT 1`,
+            [String(sourceUrl).slice(0, 767)]
         );
-        return row || null;
+        if (row) {
+            console.log(`   [DupCheck] Already exists: ${String(sourceUrl).slice(0, 80)}`);
+            return true;
+        }
+        return false;
     },
 
     /**
-     * Check title similarity trước khi crawl — tránh trùng nội dung từ nhiều nguồn
-     * Trả về true nếu đã có bài tương tự hôm nay
+     * Check title similarity trong ngày — fallback khi source_url không đủ tin cậy
      */
     async isTitleDuplicate(newTitle, threshold = 0.6) {
         const today = new Date().toISOString().slice(0, 10);
-        // Check tất cả ngôn ngữ, chỉ cần 1 bài English trùng là đủ để skip
         const [rows] = await db.query(
-            `SELECT title_raw FROM articles WHERE DATE(created_at) = ? AND title_raw IS NOT NULL GROUP BY title_raw`,
+            `SELECT title_raw FROM art_raw WHERE DATE(created_at) = ? AND title_raw IS NOT NULL`,
             [today]
         );
         const normalize = t => t.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
@@ -96,45 +56,133 @@ const Article = {
     },
 
     /**
-     * Crawlers gọi hàm này — insert raw content, status: pending
-     * Chưa có title_ai/content_ai, worker sẽ xử lý sau
-     * Không classify ở đây — để worker dùng AI classify chính xác hơn
+     * Crawlers gọi hàm này:
+     * 1. Check duplicate qua UNIQUE source_url
+     * 2. Classify AI 1 lần → topic_id (không cần site_type_id nữa)
+     * 3. Tìm tất cả websites match topic
+     * 4. Insert art_raw (1 row — nội dung gốc thuần túy)
+     * 5. Insert art_processed cho từng website cụ thể
      */
-    async createPending(data) {
-        const slug = slugify(data.title_raw || `article-${Date.now()}`);
+    async classifyAndQueue(detail) {
+        const { classifyArticle } = require('./ai');
 
-        // INSERT IGNORE — nếu (origin_id, language) đã tồn tại thì bỏ qua
-        const [result] = await db.query(
-            `INSERT IGNORE INTO articles
-             (origin_id, language, source_url, title_raw, content_raw,
-              slug, featured_image, author, post_date, category, status, flow, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW())`,
+        const sourceUrl = String(detail.source_url || detail.origin_id || '').slice(0, 767);
+        if (!sourceUrl) {
+            console.warn(`   [Queue] No source_url — skip`);
+            return 0;
+        }
+
+        // Check duplicate bằng UNIQUE index
+        const [[existing]] = await db.query(
+            `SELECT id FROM art_raw WHERE source_url = ? LIMIT 1`, [sourceUrl]
+        );
+        if (existing) {
+            console.log(`   [Skip] Already exists: ${sourceUrl.slice(0, 80)}`);
+            return 0;
+        }
+
+        // Load topics only (không cần site_types)
+        const [topics] = await db.query(`SELECT DISTINCT id, name FROM site_tags WHERE is_active = 1`);
+
+        // Classify 1 lần — chỉ cần topic
+        let topic_id = null;
+        try {
+            const cls = await classifyArticle(detail.content_raw, detail.title_raw, topics);
+            if (cls?.topic) {
+                const t = topics.find(t => t.name.toLowerCase() === cls.topic.toLowerCase().trim());
+                if (t) topic_id = t.id;
+                else console.warn(`   [Classify] Topic "${cls.topic}" not in DB`);
+            }
+        } catch (e) {
+            console.warn(`   [Classify] Error: ${e.message}`);
+        }
+
+        if (!topic_id) {
+            console.warn(`   [Classify] ❌ Failed to classify topic — skip "${detail.title_raw?.slice(0, 50)}"`);
+            return 0;
+        }
+
+        // Tìm tất cả websites Tier 3 ACTIVE match topic (không check type_id)
+        const [matchingWebsites] = await db.query(
+            `SELECT DISTINCT w.id, w.site_name, w.language, w.type_id, w.level
+             FROM site_main w
+             LEFT JOIN site_topics wt ON wt.website_id = w.id
+             WHERE w.status = 'active'
+               AND w.level = 3
+               AND (wt.topic_id = ? OR wt.topic_id IS NULL)
+             ORDER BY w.id`,
+            [topic_id]
+        );
+
+        if (matchingWebsites.length === 0) {
+            console.warn(`   [Classify] ❌ No active Tier 3 websites match topic_id=${topic_id} — skip`);
+            return 0;
+        }
+
+        console.log(`   [Classify] ✅ topic_id=${topic_id} | ${matchingWebsites.length} active Tier 3 websites | "${detail.title_raw?.slice(0, 50)}"`);
+        matchingWebsites.forEach(w => console.log(`      → ${w.site_name} (${w.language}) - Tier ${w.level} [ACTIVE]`));
+
+        // Insert art_raw — chỉ lưu nội dung gốc
+        const [rawResult] = await db.query(
+            `INSERT IGNORE INTO art_raw
+             (source_url, origin_id, title_raw, content_raw,
+              featured_image, author, post_date, category)
+             VALUES (?,?,?,?,?,?,?,?)`,
             [
-                data.origin_id || null, data.language || 'English', data.source_url || null,
-                data.title_raw || null, data.content_raw || null,
-                slug, data.featured_image || null, data.author || 'Admin',
-                toDatetime(data.post_date), data.category || 'Cricket News',
-                'pending', data.flow || 1,
+                sourceUrl,
+                detail.origin_id || null,
+                detail.title_raw || null,
+                detail.content_raw || null,
+                detail.featured_image || null,
+                detail.author || 'Admin',
+                toDatetime(detail.post_date),
+                detail.category || 'Cricket News',
             ]
         );
-        if (result.affectedRows === 0) {
-            console.log(`   [Skip] Already exists: origin_id=${data.origin_id} lang=${data.language}`);
-            return null;
+
+        if (rawResult.affectedRows === 0) {
+            console.log(`   [Skip] art_raw race condition: ${sourceUrl.slice(0, 80)}`);
+            return 0;
         }
-        return { id: result.insertId, ...data };
+
+        const rawId = rawResult.insertId;
+
+        // Insert art_processed cho từng website cụ thể
+        let totalQueued = 0;
+        for (let i = 0; i < matchingWebsites.length; i++) {
+            const website = matchingWebsites[i];
+            const variant = i + 1; // variant 1, 2, 3...
+            
+            const baseSlug = slugify(detail.title_raw || `article-${Date.now()}`);
+            const slug = matchingWebsites.length > 1 ? `${baseSlug}-${website.id}` : baseSlug;
+            
+            // Lưu site_type_id từ website (nếu có)
+            const [result] = await db.query(
+                `INSERT IGNORE INTO art_processed
+                 (raw_id, language, slug, topic_id, site_type_id, flow, status, variant, website_id, tier)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+                [rawId, website.language, slug, topic_id, website.type_id || null, 1, 'pending', variant, website.id, website.level]
+            );
+            if (result.affectedRows > 0) {
+                totalQueued++;
+                console.log(`   [Queue] → website_id=${website.id} (${website.site_name}) lang=${website.language} tier=${website.level} variant=${variant}`);
+            }
+        }
+
+        console.log(`   [Queue] raw_id=${rawId} → ${totalQueued} articles queued for ${matchingWebsites.length} Tier 3 websites`);
+        return totalQueued;
     },
 
     /**
-     * Worker gọi hàm này sau khi AI xong
-     * Update title_ai, content_ai, status: processed
+     * Worker gọi sau khi AI gen xong
      */
     async updateAI(id, ai, titleRaw, topic_id = null, site_type_id = null) {
         const slug = slugify(titleRaw || ai.title);
         await db.query(
-            `UPDATE articles SET
+            `UPDATE art_processed SET
                 title_ai = ?, content_ai = ?, slug = ?,
                 meta_description = ?, focus_keyword = ?,
-                topic_id = COALESCE(?, topic_id),
+                topic_id     = COALESCE(?, topic_id),
                 site_type_id = COALESCE(?, site_type_id),
                 status = 'processed'
              WHERE id = ?`,
@@ -146,13 +194,18 @@ const Article = {
             ]
         );
         if (ai.keywords?.length) {
-            const values = ai.keywords.filter(k => k).map(kw => [id, String(kw).slice(0, 255)]);
-            await db.query(`INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES ?`, [values]);
+            // Note: article_keywords table might not exist, we'll handle this gracefully
+            try {
+                const values = ai.keywords.filter(k => k).map(kw => [id, String(kw).slice(0, 255)]);
+                await db.query(`INSERT IGNORE INTO article_keywords (article_id, keyword) VALUES ?`, [values]);
+            } catch (e) {
+                console.warn(`   [Keywords] Table might not exist: ${e.message}`);
+            }
         }
     },
 
     async updateStatus(id, status) {
-        await db.query(`UPDATE articles SET status = ? WHERE id = ?`, [status, id]);
+        await db.query(`UPDATE art_processed SET status = ? WHERE id = ?`, [status, id]);
     },
 };
 

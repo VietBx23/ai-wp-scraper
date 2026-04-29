@@ -3,7 +3,6 @@ const he = require('he');
 const Article = require('../article');
 
 const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
-const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 
 async function run() {
     if (!process.env.CRAWL_URL) { console.log('[BDCric] CRAWL_URL not set, skipping.'); return; }
@@ -17,21 +16,23 @@ async function run() {
             for (const item of posts) {
                 if (count >= MAX) { running = false; break; }
                 if (new Date(item.post_date).toDateString() !== new Date().toDateString()) { running = false; break; }
-                const exists = await Article.findOne({ $or: [{ origin_id: String(item.ID) }, { source_url: item.guid }] });
-                if (exists) continue;
+                
+                // Check duplicate by source URL
+                if (await Article.isSourceDuplicate(item.guid)) continue;
+                
                 const content = he.decode(item.post_content || '');
                 if (await Article.isTitleDuplicate(item.post_title)) continue;
-                for (const lang of LANGS) {
-                    await Article.createPending({
-                        origin_id: String(item.ID), source_url: item.guid, language: lang,
-                        title_raw: item.post_title, content_raw: content,
-                        featured_image: item.attachments?.[0]?.guid || null,
-                        author: item.user?.[0]?.display_name || 'Admin',
-                        category: 'Cricket News', post_date: new Date(item.post_date),
-                    });
+                const queued = await Article.classifyAndQueue({
+                    origin_id: String(item.ID), source_url: item.guid,
+                    title_raw: item.post_title, content_raw: content,
+                    featured_image: item.attachments?.[0]?.guid || null,
+                    author: item.user?.[0]?.display_name || 'Admin',
+                    category: 'Cricket News', post_date: new Date(item.post_date),
+                });
+                if (queued > 0) {
+                    console.log(`[BDCric] Queued (${queued} articles): ${item.post_title.slice(0, 60)}`);
+                    count++;
                 }
-                console.log(`[BDCric] Queued: ${item.post_title.slice(0, 60)}`);
-                count++;
             }
             page++;
             await new Promise(r => setTimeout(r, 500));

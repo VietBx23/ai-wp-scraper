@@ -10,6 +10,25 @@ const aiConfig = {
     hf:        [process.env.HF_KEY_1,        process.env.HF_KEY_2].filter(Boolean),
 };
 
+// Track rate limits per provider
+const rateLimitTracker = new Map();
+
+function isRateLimited(providerName) {
+    const limit = rateLimitTracker.get(providerName);
+    if (!limit) return false;
+    if (Date.now() < limit.until) {
+        const remainingSeconds = Math.ceil((limit.until - Date.now()) / 1000);
+        return remainingSeconds;
+    }
+    rateLimitTracker.delete(providerName);
+    return false;
+}
+
+function setRateLimit(providerName, durationMs = 60000) {
+    rateLimitTracker.set(providerName, { until: Date.now() + durationMs });
+    console.log(`      ⏰ ${providerName} rate limited for ${durationMs/1000}s`);
+}
+
 function getProviders() {
     const list = [];
     aiConfig.sambanova.forEach((k, i) => list.push({ name: `SAMBANOVA_${i+1}`, type: 'openai', url: 'https://api.sambanova.ai/v1/chat/completions',   model: 'Meta-Llama-3.3-70B-Instruct', key: k }));
@@ -61,14 +80,21 @@ function cleanAndParseJSON(text) {
     } catch { return null; }
 }
 
-async function callMultiAI(prompt, targetLang = 'English', providerIdx = 0) {
+async function callMultiAI(prompt, targetLang = 'English', providerIdx = 0, retryCount = 0) {
     const providers = getProviders();
     if (providerIdx >= providers.length) {
         console.error('❌ All AI providers failed');
         return null;
     }
     const ai = providers[providerIdx];
-    if (!ai.key) return callMultiAI(prompt, targetLang, providerIdx + 1);
+    if (!ai.key) return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
+
+    // Check if provider is rate limited
+    const rateLimitRemaining = isRateLimited(ai.name);
+    if (rateLimitRemaining) {
+        console.log(`      ⏭️  ${ai.name} rate limited (${rateLimitRemaining}s remaining) -> skip`);
+        return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
+    }
 
     console.log(`   [AI] Trying ${ai.name}...`);
     try {
@@ -110,21 +136,26 @@ async function callMultiAI(prompt, targetLang = 'English', providerIdx = 0) {
         const parsed = cleanAndParseJSON(text);
         if (parsed) return parsed;
         console.warn(`      ⚠️ ${ai.name} JSON parse failed -> next...`);
-        return callMultiAI(prompt, targetLang, providerIdx + 1);
+        return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
 
     } catch (e) {
         const msg = e.message || '';
         const isNoCredits = msg.includes('depleted') || msg.includes('credits') || msg.includes('subscribe');
         const is429 = e.response?.status === 429 || msg.includes('429') || msg.toLowerCase().includes('rate');
+        
         if (isNoCredits) {
             console.warn(`      ⚠️ ${ai.name} no credits -> skip`);
+            return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
         } else if (is429) {
-            console.log(`      🔄 ${ai.name} rate limit -> wait 5s...`);
-            await new Promise(r => setTimeout(r, 5000));
+            // Exponential backoff: 30s, 60s, 120s
+            const waitTime = Math.min(30000 * Math.pow(2, retryCount), 120000);
+            setRateLimit(ai.name, waitTime);
+            console.log(`      🔄 ${ai.name} rate limit -> trying next provider...`);
+            return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
         } else {
             console.log(`      🔄 ${ai.name} error (${msg.slice(0, 80)}) -> next...`);
+            return callMultiAI(prompt, targetLang, providerIdx + 1, 0);
         }
-        return callMultiAI(prompt, targetLang, providerIdx + 1);
     }
 }
 
@@ -145,26 +176,22 @@ ARTICLE CONTENT: ${rawContent?.slice(0, 2500)}`;
     return await callMultiAI(prompt, 'English', 0);
 }
 
-// Classify topic và site type từ danh sách thực trong DB
-async function classifyArticle(rawContent, title, topics = [], siteTypes = []) {
-    const topicList    = topics.map(t => `"${t.name}"`).join(', ');
-    const siteTypeList = siteTypes.map(t => `"${t.name}"`).join(', ');
+// Classify topic từ danh sách thực trong DB (không cần site_type nữa)
+async function classifyArticle(rawContent, title, topics = []) {
+    const topicList = topics.map(t => `"${t.name}"`).join(', ');
 
-    const prompt = `You are a content classifier. Read this cricket article and pick EXACTLY ONE topic and ONE site type from the lists below.
+    const prompt = `You are a content classifier. Read this cricket article and pick EXACTLY ONE topic from the list below.
 
 AVAILABLE TOPICS (pick exactly one): [${topicList}]
-AVAILABLE SITE TYPES (pick exactly one): [${siteTypeList}]
 
 RULES:
 - You MUST return a value from the list above, do NOT invent new ones
 - Pick the most relevant match based on article content
-- If unsure about topic, pick the closest match
-- If unsure about site type, pick the closest match
+- If unsure, pick the closest match
 
 OUTPUT pure JSON only:
 {
-  "topic": "exact name from AVAILABLE TOPICS list",
-  "site_type": "exact name from AVAILABLE SITE TYPES list"
+  "topic": "exact name from AVAILABLE TOPICS list"
 }
 
 ARTICLE TITLE: ${title}
@@ -174,7 +201,7 @@ ARTICLE CONTENT: ${rawContent?.slice(0, 1500)}`;
     return result;
 }
 
-async function writeArticleFromFacts(facts, originalTitle, targetLanguage, interlink = null) {
+async function writeArticleFromFacts(facts, originalTitle, targetLanguage) {
     const langInstructions = {
         'English': 'Write in fluent, engaging British/American English.',
         'Hindi':   'हिंदी में लिखें। भारतीय क्रिकेट प्रशंसकों के लिए उत्साहजनक शैली में।',
@@ -182,21 +209,13 @@ async function writeArticleFromFacts(facts, originalTitle, targetLanguage, inter
         'Urdu':    'اردو میں لکھیں۔ پاکستانی شائقین کے لیے پرجوش انداز میں۔'
     };
 
-    const interlinkInstruction = interlink
-        ? `INTERLINK REQUIREMENT (MANDATORY):
-- You MUST naturally embed this link once inside the article body, within a relevant sentence or paragraph.
-- Use the anchor text as the clickable text, do NOT place it in a standalone <p> tag.
-- Example: <a href="${interlink.url}" title="${interlink.anchor_text}" rel="dofollow">${interlink.anchor_text}</a>
-- Place it where it reads naturally in context, around the middle of the article.`
-        : '';
-
     const prompt = `You are an elite Sports Journalist. Write a complete SEO-optimized cricket article in ${targetLanguage}.
 LANGUAGE INSTRUCTION: ${langInstructions[targetLanguage] || langInstructions['English']}
 WRITE ENTIRELY IN ${targetLanguage}. Every word must be in ${targetLanguage}.
 KEY FACTS TO USE:
 ${JSON.stringify(facts, null, 2)}
 ORIGINAL TITLE (for reference): ${originalTitle}
-${interlinkInstruction}
+
 ARTICLE REQUIREMENTS:
 - 900-1200 words
 - Engaging, viral-worthy sports writing
@@ -208,8 +227,8 @@ OUTPUT pure JSON only:
   "title": "compelling SEO title in ${targetLanguage} (55-65 chars)",
   "content": "full HTML article in ${targetLanguage}",
   "meta_description": "SEO meta in ${targetLanguage} (145-158 chars)",
-  "focus_keyword": "main keyword in ${targetLanguage}",
-  "keywords": ["kw1","kw2","kw3","kw4","kw5","kw6"]
+  "focus_keyword": "4-5 main SEO keywords in ${targetLanguage}, comma-separated",
+  "keywords": ["kw1","kw2","kw3","kw4","kw5","kw6","kw7","kw8"]
 }`;
     const result = await callMultiAI(prompt, targetLanguage, 0);
     if (result && validateAIOutput(result, targetLanguage)) return result;
@@ -240,8 +259,8 @@ Output pure JSON only:
   "title": "SEO title in ${targetLanguage}",
   "content": "HTML article in ${targetLanguage} (min 600 words)",
   "meta_description": "meta in ${targetLanguage}",
-  "focus_keyword": "keyword in ${targetLanguage}",
-  "keywords": ["kw1","kw2","kw3","kw4","kw5"]
+  "focus_keyword": "4-5 main SEO keywords in ${targetLanguage}, comma-separated",
+  "keywords": ["kw1","kw2","kw3","kw4","kw5","kw6","kw7","kw8"]
 }
 TITLE: ${title}
 CONTENT: ${postContent?.slice(0, 2000)}`;

@@ -3,10 +3,17 @@ const cheerio = require('cheerio');
 const Article = require('../article');
 
 const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
-const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Cache-Control': 'max-age=0',
 };
 
 function isToday(dateStr) {
@@ -23,7 +30,8 @@ async function scrapeDetail(url) {
     try {
         const { data } = await axios.get(url, {
             headers: { ...HEADERS, Referer: 'https://www.espncricinfo.com/cricket-news' },
-            timeout: 25000
+            timeout: 25000,
+            maxRedirects: 5,
         });
         const $ = cheerio.load(data);
         const title = $('h1').first().text().trim();
@@ -48,7 +56,9 @@ async function run() {
     let count = 0;
     try {
         const { data } = await axios.get('https://www.espncricinfo.com/cricket-news', {
-            headers: HEADERS, timeout: 30000
+            headers: HEADERS, 
+            timeout: 30000,
+            maxRedirects: 5,
         });
         const $ = cheerio.load(data);
         const links = [];
@@ -67,28 +77,33 @@ async function run() {
         for (const { url, timeInfo } of links) {
             if (count >= MAX) break;
             if (timeInfo && !isToday(timeInfo)) continue;
-            const exists = await Article.findOne({ $or: [{ source_url: url }, { origin_id: url }] });
-            if (exists) continue;
+            
+            // Check if already exists
+            if (await Article.isSourceDuplicate(url)) continue;
+            
             const detail = await scrapeDetail(url);
             if (!detail) continue;
             if (await Article.isTitleDuplicate(detail.title)) continue;
-            // Insert pending cho mỗi ngôn ngữ — AI worker xử lý sau
-            for (const lang of LANGS) {
-                await Article.createPending({
-                    origin_id: url, source_url: url, language: lang,
-                    title_raw: detail.title, content_raw: detail.content,
-                    featured_image: detail.featured_image, author: detail.author,
-                    category: detail.category, post_date: new Date(),
-                });
+            
+            const queued = await Article.classifyAndQueue({
+                origin_id: url, source_url: url,
+                title_raw: detail.title, content_raw: detail.content,
+                featured_image: detail.featured_image, author: detail.author,
+                category: detail.category, post_date: new Date(),
+            });
+            if (queued > 0) {
+                console.log(`[ESPN] Queued (${queued} variants): ${detail.title.slice(0, 60)}`);
+                count++;
             }
-            console.log(`[ESPN] Queued: ${detail.title.slice(0, 60)}`);
-            count++;
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 1500)); // Longer delay to avoid rate limits
         }
         console.log(`[ESPN] Done. ${count} articles queued.`);
     } catch (e) {
-        if (e.response?.status === 403) console.log('[ESPN] Blocked (403).');
-        else console.error('[ESPN] Error:', e.message);
+        if (e.response?.status === 403) {
+            console.log('[ESPN] Blocked (403) - ESPN has anti-bot protection. Consider using got-scraping or disable this source.');
+        } else {
+            console.error('[ESPN] Error:', e.message);
+        }
     }
 }
 

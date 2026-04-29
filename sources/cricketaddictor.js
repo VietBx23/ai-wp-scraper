@@ -3,7 +3,6 @@ const cheerio = require('cheerio');
 const Article = require('../article');
 
 const MAX = parseInt(process.env.MAX_NEW_PER_CYCLE) || 5;
-const LANGS = ['English', 'Hindi', 'Bengali', 'Urdu'];
 const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36' };
 
 function isToday(dateStr) {
@@ -52,21 +51,23 @@ async function run() {
         for (const { url, timeInfo } of items) {
             if (count >= MAX) break;
             if (timeInfo && !isToday(timeInfo)) continue;
-            const exists = await Article.findOne({ $or: [{ source_url: url }, { origin_id: url }] });
-            if (exists) continue;
+            
+            // Check duplicate by source URL
+            if (await Article.isSourceDuplicate(url)) continue;
+            
             const detail = await scrapeDetail(url);
             if (!detail) continue;
             if (await Article.isTitleDuplicate(detail.title)) continue;
-            for (const lang of LANGS) {
-                await Article.createPending({
-                    origin_id: url, source_url: url, language: lang,
-                    title_raw: detail.title, content_raw: detail.content,
-                    featured_image: detail.featured_image, author: detail.author,
-                    category: detail.category, post_date: new Date(),
-                });
+            const queued = await Article.classifyAndQueue({
+                origin_id: url, source_url: url,
+                title_raw: detail.title, content_raw: detail.content,
+                featured_image: detail.featured_image, author: detail.author,
+                category: detail.category, post_date: new Date(),
+            });
+            if (queued > 0) {
+                console.log(`[CricketAddictor] Queued (${queued} articles): ${detail.title.slice(0, 60)}`);
+                count++;
             }
-            console.log(`[CricketAddictor] Queued: ${detail.title.slice(0, 60)}`);
-            count++;
             await new Promise(r => setTimeout(r, 500));
         }
         console.log(`[CricketAddictor] Done. ${count} articles queued.`);
